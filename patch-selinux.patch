@@ -1,0 +1,171 @@
+diff -up patch-2.6/Makefile.in.selinux patch-2.6/Makefile.in
+--- patch-2.6/Makefile.in.selinux	2009-11-02 19:09:57.000000000 +0000
++++ patch-2.6/Makefile.in	2010-08-16 17:26:07.492049261 +0100
+@@ -40,7 +40,7 @@ EXEEXT = @EXEEXT@
+ LDFLAGS = @LDFLAGS@
+ LIBOBJDIR = gl/lib/
+ LIBOBJS = @LIBOBJS@ ${LIBOBJDIR}full-write$U.o
+-LIBS = @LIBS@
++LIBS = @LIBS@ -lselinux
+ OBJEXT = @OBJEXT@
+ PACKAGE_NAME = @PACKAGE_NAME@
+ PACKAGE_VERSION = @PACKAGE_VERSION@
+diff -up patch-2.6/src/common.h.selinux patch-2.6/src/common.h
+--- patch-2.6/src/common.h.selinux	2009-11-02 19:09:57.000000000 +0000
++++ patch-2.6/src/common.h	2010-08-16 17:26:07.492049261 +0100
+@@ -32,6 +32,8 @@
+ #include <sys/types.h>
+ #include <time.h>
+ 
++#include <selinux/selinux.h>
++
+ #include <sys/stat.h>
+ #if ! defined S_ISDIR && defined S_IFDIR
+ # define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+@@ -118,6 +120,7 @@ XTERN char *outfile;
+ XTERN int inerrno;
+ XTERN int invc;
+ XTERN struct stat instat;
++XTERN security_context_t incontext;
+ XTERN bool dry_run;
+ XTERN bool posixly_correct;
+ 
+diff -up patch-2.6/src/inp.c.selinux patch-2.6/src/inp.c
+--- patch-2.6/src/inp.c.selinux	2010-08-16 17:26:07.478049200 +0100
++++ patch-2.6/src/inp.c	2010-08-16 17:26:43.087048488 +0100
+@@ -152,8 +152,18 @@ get_input_file (char const *filename, ch
+     char *diffbuf;
+     char *getbuf;
+ 
+-    if (inerrno == -1)
+-      inerrno = stat (filename, &instat) == 0 ? 0 : errno;
++    inerrno = stat (filename, &instat) == 0 ? 0 : errno;
++    if (inerrno == 0)
++      {
++        inerrno = getfilecon (inname, &incontext) == -1 ? errno : 0;
++        if (inerrno == ENODATA || inerrno == ENOTSUP)
++          {
++    	inerrno = 0;
++    	incontext = NULL;
++          }
++      }
++    else
++      incontext = NULL;
+ 
+     /* Perhaps look for RCS or SCCS versions.  */
+     if (patch_get
+@@ -197,7 +207,7 @@ get_input_file (char const *filename, ch
+ 	    }
+ 
+ 	    if (cs && version_get (filename, cs, ! inerrno, elsewhere, getbuf,
+-				   &instat))
++				   &instat, &incontext))
+ 	      inerrno = 0;
+ 
+ 	    free (getbuf);
+@@ -209,6 +219,7 @@ get_input_file (char const *filename, ch
+       {
+ 	instat.st_mode = S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH;
+ 	instat.st_size = 0;
++	incontext = NULL;
+       }
+     else if (! S_ISREG (instat.st_mode))
+       fatal ("File %s is not a regular file -- can't patch",
+diff -up patch-2.6/src/patch.c.selinux patch-2.6/src/patch.c
+--- patch-2.6/src/patch.c.selinux	2010-08-16 17:26:07.489048844 +0100
++++ patch-2.6/src/patch.c	2010-08-16 17:26:07.495048411 +0100
+@@ -421,6 +421,21 @@ main (int argc, char **argv)
+ 			      /* Fails if we are not in group instat.st_gid.  */
+ 			      chown (outname, -1, instat.st_gid);
+ 			    }
++
++			  if (! inerrno && incontext)
++			    {
++			      security_context_t outcontext;
++			      if (getfilecon (outname, &outcontext) != -1 &&
++				  outcontext &&
++				  strcmp(outcontext, incontext) && 
++				  setfilecon (outname, incontext) != 0)
++				{
++				  if (errno != ENOTSUP && errno != EPERM)
++				    pfatal ("Can't set security context "
++					    "on file %s", quotearg (outname));
++				}
++			    }
++
+ 			  /* FIXME: There may be other attributes to preserve.  */
+ 			}
+ 		    }
+diff -up patch-2.6/src/pch.c.selinux patch-2.6/src/pch.c
+--- patch-2.6/src/pch.c.selinux	2010-08-16 17:26:07.484051069 +0100
++++ patch-2.6/src/pch.c	2010-08-16 17:26:07.497048759 +0100
+@@ -287,7 +287,12 @@ there_is_another_patch (bool need_header
+ 	    inname[t - buf - 1] = 0;
+ 	    if (stat (inname, &instat) == 0)
+ 	      {
+-		inerrno = 0;
++		inerrno = getfilecon (inname, &incontext) == -1 ? errno : 0;
++		if (inerrno == ENODATA || inerrno == ENOTSUP)
++		  {
++		    inerrno = 0;
++		    incontext = NULL;
++		  }
+ 		invc = -1;
+ 	      }
+ 	    else
+@@ -662,7 +667,7 @@ intuit_diff_type (bool need_header)
+ 			  if (cs)
+ 			    {
+ 			      if (version_get (p_name[i], cs, false, readonly,
+-					       getbuf, &st[i]))
++					       getbuf, &st[i], NULL))
+ 				stat_errno[i] = 0;
+ 			      else
+ 				version_controlled[i] = 0;
+@@ -726,6 +731,7 @@ intuit_diff_type (bool need_header)
+ 	inerrno = stat_errno[i];
+ 	invc = version_controlled[i];
+ 	instat = st[i];
++	getfilecon (inname, &incontext);
+       }
+ 
+     return retval;
+diff -up patch-2.6/src/util.c.selinux patch-2.6/src/util.c
+--- patch-2.6/src/util.c.selinux	2009-11-02 19:09:57.000000000 +0000
++++ patch-2.6/src/util.c	2010-08-16 17:26:07.500049508 +0100
+@@ -574,7 +574,8 @@ version_controller (char const *filename
+    Return true if successful.  */
+ bool
+ version_get (char const *filename, char const *cs, bool exists, bool readonly,
+-	     char const *getbuf, struct stat *filestat)
++	     char const *getbuf, struct stat *filestat,
++	     security_context_t *filecontext)
+ {
+   if (patch_get < 0)
+     {
+@@ -599,6 +600,13 @@ version_get (char const *filename, char 
+ 	fatal ("Can't get file %s from %s", quotearg (filename), cs);
+       if (stat (filename, filestat) != 0)
+ 	pfatal ("%s", quotearg (filename));
++      if (filecontext && getfilecon (filename, filecontext) == -1)
++	{
++	  if (errno == ENODATA || errno == ENOTSUP)
++	    *filecontext = NULL;
++	  else
++	    pfatal ("%s", quotearg (filename));
++	}
+     }
+ 
+   return 1;
+diff -up patch-2.6/src/util.h.selinux patch-2.6/src/util.h
+--- patch-2.6/src/util.h.selinux	2009-11-02 19:09:57.000000000 +0000
++++ patch-2.6/src/util.h	2010-08-16 17:26:07.501048953 +0100
+@@ -51,7 +51,7 @@ char *fetchname (char *, int, char **, t
+ char *savebuf (char const *, size_t);
+ char *savestr (char const *);
+ char const *version_controller (char const *, bool, struct stat const *, char **, char **);
+-bool version_get (char const *, char const *, bool, bool, char const *, struct stat *);
++bool version_get (char const *, char const *, bool, bool, char const *, struct stat *, security_context_t *);
+ int create_file (char const *, int, mode_t, bool);
+ int systemic (char const *);
+ char *format_linenum (char[LINENUM_LENGTH_BOUND + 1], LINENUM);
